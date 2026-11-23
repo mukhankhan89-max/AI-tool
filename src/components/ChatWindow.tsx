@@ -102,9 +102,12 @@ export function ChatWindow({
   // Auto-scroll smoothly during streaming if user has not scrolled up
   const lastMessageContent = messages[messages.length - 1]?.content ?? '';
   useEffect(() => {
-    if (shouldAutoScroll && messages.length > 0) {
+    if (!shouldAutoScroll || messages.length === 0) return;
+    if (isStreaming && scrollContainerRef.current) {
+      scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight;
+    } else {
       bottomAnchorRef.current?.scrollIntoView({
-        behavior: isStreaming ? 'auto' : 'smooth',
+        behavior: 'smooth',
         block: 'end',
       });
     }

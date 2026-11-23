@@ -8,7 +8,11 @@ export function createId(): string {
 }
 
 export function deriveFallbackTitle(message: string): string {
-  const cleaned = message.replace(/\s+/g, ' ').trim();
+  const cleaned = message
+    .replace(/[`*_#>\[\]]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[?.!,;:]+$/, '');
   if (!cleaned) return 'New chat';
   if (cleaned.length <= 42) return cleaned;
   const sliced = cleaned.slice(0, 42);

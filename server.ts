@@ -17,25 +17,33 @@ const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const ALLOWED_MODELS = new Set(['gemini-3.1-flash-lite', 'gemini-4-hydrogen']);
 const DEFAULT_MODEL = 'gemini-3.1-flash-lite';
 const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
+const MAX_HISTORY_MESSAGES = 10;
 
 interface IncomingMessage {
   role: 'user' | 'assistant';
   content: string;
 }
 
+let cachedClient: GoogleGenAI | null = null;
+let cachedApiKey = '';
+
 function getGenAIClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
     return null;
   }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
+  if (!cachedClient || cachedApiKey !== apiKey) {
+    cachedApiKey = apiKey;
+    cachedClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
       },
-    },
-  });
+    });
+  }
+  return cachedClient;
 }
 
 function extractNestedErrorMessage(raw: string): string {
@@ -198,10 +206,8 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-const SYSTEM_INSTRUCTION = `You are Lumen, a fast, accurate, and clear AI assistant.
-Respond directly and concisely while remaining thorough when technical depth is helpful.
-Format code using fenced Markdown code blocks with explicit language identifiers (e.g. \`\`\`typescript).
-Use clean Markdown headings, bullet lists, and tables when they improve clarity.`;
+const SYSTEM_INSTRUCTION =
+  'Give concise, direct, accurate answers by default unless asked for detail. Use fenced Markdown code blocks with language tags.';
 
 async function startServer() {
   const app = express();
@@ -242,7 +248,7 @@ async function startServer() {
           typeof (m as IncomingMessage).content === 'string' &&
           (m as IncomingMessage).content.trim().length > 0
       )
-      .slice(-24);
+      .slice(-MAX_HISTORY_MESSAGES);
 
     if (validMessages.length === 0) {
       res.status(400).json({
@@ -312,6 +318,7 @@ async function startServer() {
               }
             : {
                 systemInstruction: SYSTEM_INSTRUCTION,
+                thinkingConfig: {thinkingLevel: ThinkingLevel.MINIMAL},
                 abortSignal: attemptController.signal,
               };
 
@@ -344,7 +351,7 @@ async function startServer() {
       }
     };
 
-    // Build resilient attempt plan: try requested model with fast fallback to Flash Lite if Hydrogen stalls or returns 503
+    // Build resilient attempt plan: try requested model with fast 4s fallback to Flash Lite if Hydrogen stalls or returns 503
     const modelsToTry =
       requestedModel === 'gemini-4-hydrogen'
         ? ['gemini-4-hydrogen', FALLBACK_MODEL]
@@ -358,7 +365,7 @@ async function startServer() {
       const hasFallbackNext = i < modelsToTry.length - 1 && modelsToTry[i + 1] !== targetModel;
 
       try {
-        await attemptStream(targetModel, hasFallbackNext ? 10000 : undefined);
+        await attemptStream(targetModel, hasFallbackNext ? 4000 : undefined);
         lastError = null;
         break;
       } catch (err) {
@@ -380,7 +387,7 @@ async function startServer() {
         // Wait briefly before retry or fallback
         if (i < modelsToTry.length - 1) {
           try {
-            await sleep(350 * (i + 1), abortController.signal);
+            await sleep(150 * (i + 1), abortController.signal);
           } catch {
             if (!res.writableEnded) res.end();
             return;

@@ -15,11 +15,29 @@ import {
   saveModel,
 } from '../utils/storage';
 
+// Send only recent relevant conversation turns to minimize payload and latency
+const MAX_HISTORY_MESSAGES = 10;
+
 interface StreamParams {
   conversationId: string;
   historyForApi: Array<{role: 'user' | 'assistant'; content: string}>;
   assistantMessageId: string;
   modelToUse: GeminiModelId;
+}
+
+function buildCompactHistory(
+  messages: ChatMessage[],
+  extraUserContent?: string
+): Array<{role: 'user' | 'assistant'; content: string}> {
+  const cleaned = messages
+    .filter((m) => m.content.trim().length > 0 && !m.isError)
+    .map((m) => ({role: m.role, content: m.content}));
+
+  if (extraUserContent) {
+    cleaned.push({role: 'user', content: extraUserContent});
+  }
+
+  return cleaned.slice(-MAX_HISTORY_MESSAGES);
 }
 
 export function useConversations() {
@@ -42,8 +60,6 @@ export function useConversations() {
   const conversationsRef = useRef<Conversation[]>(conversations);
   conversationsRef.current = conversations;
 
-  const lastPersistedRef = useRef<number>(0);
-
   useEffect(() => {
     saveActiveChatId(activeChatId);
   }, [activeChatId]);
@@ -52,17 +68,10 @@ export function useConversations() {
     saveModel(model);
   }, [model]);
 
-  // Persist immediately when not mid-stream, or throttled during long streams
+  // Persist only when idle (avoid JSON.stringify overhead on main thread during active streaming)
   useEffect(() => {
     if (!streamingChatId) {
       saveConversations(conversations);
-      lastPersistedRef.current = Date.now();
-      return;
-    }
-    const now = Date.now();
-    if (now - lastPersistedRef.current > 800) {
-      saveConversations(conversations);
-      lastPersistedRef.current = now;
     }
   }, [conversations, streamingChatId]);
 
@@ -161,30 +170,6 @@ export function useConversations() {
     saveConversations([]);
   }, [stopGeneration]);
 
-  const generateSmartTitle = useCallback(async (conversationId: string, firstMessage: string) => {
-    try {
-      const response = await fetch('/api/title', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({message: firstMessage}),
-      });
-      if (!response.ok) return;
-      const data = (await response.json()) as {title?: string};
-      const aiTitle = typeof data.title === 'string' ? data.title.trim() : '';
-      if (!aiTitle) return;
-
-      setConversations((prev) =>
-        prev.map((c) =>
-          c.id === conversationId && c.isAutoTitled !== false
-            ? {...c, title: aiTitle, isAutoTitled: true}
-            : c
-        )
-      );
-    } catch {
-      // Keep fallback derived title silently on network error
-    }
-  }, []);
-
   const streamAssistantReply = useCallback(
     async ({conversationId, historyForApi, assistantMessageId, modelToUse}: StreamParams): Promise<boolean> => {
       stopGeneration();
@@ -196,6 +181,37 @@ export function useConversations() {
       setError(null);
 
       let accumulatedText = '';
+      let firstTokenRendered = false;
+      let rafId: number | null = null;
+
+      const flushTextToState = () => {
+        rafId = null;
+        const snapshot = accumulatedText;
+        setConversations((prev) =>
+          prev.map((c) => {
+            if (c.id !== conversationId) return c;
+            return {
+              ...c,
+              updatedAt: Date.now(),
+              messages: c.messages.map((m) =>
+                m.id === assistantMessageId ? {...m, content: snapshot} : m
+              ),
+            };
+          })
+        );
+      };
+
+      const scheduleRender = () => {
+        // Render first token synchronously with zero delay, then batch rapid bursts per animation frame
+        if (!firstTokenRendered) {
+          firstTokenRendered = true;
+          flushTextToState();
+          return;
+        }
+        if (rafId === null) {
+          rafId = window.requestAnimationFrame(flushTextToState);
+        }
+      };
 
       const processLine = (rawLine: string) => {
         const line = rawLine.trim();
@@ -218,19 +234,7 @@ export function useConversations() {
 
         if (typeof eventData.text === 'string' && eventData.text.length > 0) {
           accumulatedText += eventData.text;
-          const currentText = accumulatedText;
-          setConversations((prev) =>
-            prev.map((c) => {
-              if (c.id !== conversationId) return c;
-              return {
-                ...c,
-                updatedAt: Date.now(),
-                messages: c.messages.map((m) =>
-                  m.id === assistantMessageId ? {...m, content: currentText} : m
-                ),
-              };
-            })
-          );
+          scheduleRender();
         }
       };
 
@@ -246,7 +250,10 @@ export function useConversations() {
         });
 
         if (!response.ok) {
-          let errMsg = `Request failed (${response.status}).`;
+          let errMsg =
+            response.status === 404
+              ? 'Chat API endpoint not found (404). Make sure /api/chat is deployed on your host.'
+              : `Request failed (${response.status}).`;
           let errCode = 'HTTP_ERROR';
           try {
             const errJson = (await response.json()) as {error?: string; code?: string};
@@ -286,6 +293,11 @@ export function useConversations() {
           }
         }
 
+        if (rafId !== null) {
+          window.cancelAnimationFrame(rafId);
+          rafId = null;
+        }
+
         if (!accumulatedText.trim()) {
           throw Object.assign(
             new Error('Gemini returned an empty response. Please try again.'),
@@ -293,10 +305,19 @@ export function useConversations() {
           );
         }
 
+        // Flush final complete text synchronously
+        flushTextToState();
         return true;
       } catch (err) {
+        if (rafId !== null) {
+          window.cancelAnimationFrame(rafId);
+          rafId = null;
+        }
+
         if (controller.signal.aborted) {
-          if (!accumulatedText.trim()) {
+          if (accumulatedText.trim()) {
+            flushTextToState();
+          } else {
             setConversations((prev) =>
               prev.map((c) =>
                 c.id === conversationId
@@ -322,7 +343,9 @@ export function useConversations() {
           retryable: true,
         });
 
-        if (!accumulatedText.trim()) {
+        if (accumulatedText.trim()) {
+          flushTextToState();
+        } else {
           setConversations((prev) =>
             prev.map((c) =>
               c.id === conversationId
@@ -336,6 +359,9 @@ export function useConversations() {
         }
         return false;
       } finally {
+        if (rafId !== null) {
+          window.cancelAnimationFrame(rafId);
+        }
         if (abortControllerRef.current === controller) {
           abortControllerRef.current = null;
         }
@@ -367,14 +393,12 @@ export function useConversations() {
       };
 
       let targetChatId = activeChatId;
-      let isFirstMessage = false;
       let historyForApi: Array<{role: 'user' | 'assistant'; content: string}> = [];
 
       const existing = conversationsRef.current.find((c) => c.id === targetChatId);
 
       if (!existing) {
         targetChatId = createId();
-        isFirstMessage = true;
         const derivedTitle = deriveFallbackTitle(content);
         const newChat: Conversation = {
           id: targetChatId,
@@ -388,15 +412,10 @@ export function useConversations() {
         setConversations((prev) => [newChat, ...prev]);
         setActiveChatId(targetChatId);
       } else {
-        isFirstMessage = existing.messages.length === 0;
+        const isFirstMessage = existing.messages.length === 0;
         const shouldAutoTitle = isFirstMessage && existing.isAutoTitled !== false;
         const updatedTitle = shouldAutoTitle ? deriveFallbackTitle(content) : existing.title;
-        historyForApi = [
-          ...existing.messages
-            .filter((m) => m.content.trim().length > 0 && !m.isError)
-            .map((m) => ({role: m.role, content: m.content})),
-          {role: 'user', content},
-        ];
+        historyForApi = buildCompactHistory(existing.messages, content);
 
         setConversations((prev) => {
           const updated = prev.map((c) =>
@@ -414,18 +433,15 @@ export function useConversations() {
       }
 
       if (targetChatId) {
-        const ok = await streamAssistantReply({
+        await streamAssistantReply({
           conversationId: targetChatId,
           historyForApi,
           assistantMessageId: assistantMsg.id,
           modelToUse: model,
         });
-        if (ok && isFirstMessage) {
-          void generateSmartTitle(targetChatId, content);
-        }
       }
     },
-    [activeChatId, generateSmartTitle, isStreaming, model, streamAssistantReply]
+    [activeChatId, isStreaming, model, streamAssistantReply]
   );
 
   const regenerateResponse = useCallback(
@@ -438,7 +454,6 @@ export function useConversations() {
       if (targetMessageId) {
         cutIndex = chat.messages.findIndex((m) => m.id === targetMessageId);
       } else {
-        // Find last assistant message, or regenerate after last user message if error left user message at end
         const lastMsg = chat.messages[chat.messages.length - 1];
         if (lastMsg.role === 'assistant') {
           cutIndex = chat.messages.length - 1;
@@ -450,9 +465,7 @@ export function useConversations() {
       if (cutIndex >= 0 && chat.messages[cutIndex]?.role === 'assistant') {
         const assistantId = chat.messages[cutIndex].id;
         const precedingMessages = chat.messages.slice(0, cutIndex);
-        const historyForApi = precedingMessages
-          .filter((m) => m.content.trim().length > 0 && !m.isError)
-          .map((m) => ({role: m.role, content: m.content}));
+        const historyForApi = buildCompactHistory(precedingMessages);
 
         if (historyForApi.length === 0) return;
 
@@ -485,7 +498,6 @@ export function useConversations() {
         return;
       }
 
-      // Case: Last message is a user message (e.g. previous attempt failed before any tokens arrived)
       const lastUserIndex = [...chat.messages].reverse().findIndex((m) => m.role === 'user');
       if (lastUserIndex === -1) return;
       const actualUserIndex = chat.messages.length - 1 - lastUserIndex;
@@ -496,9 +508,7 @@ export function useConversations() {
         content: '',
         createdAt: now,
       };
-      const historyForApi = baseMessages
-        .filter((m) => m.content.trim().length > 0 && !m.isError)
-        .map((m) => ({role: m.role, content: m.content}));
+      const historyForApi = buildCompactHistory(baseMessages);
 
       setConversations((prev) =>
         prev.map((c) =>
@@ -547,10 +557,7 @@ export function useConversations() {
       };
 
       const prefixMessages = [...chat.messages.slice(0, msgIndex), updatedUserMsg];
-      const historyForApi = prefixMessages
-        .filter((m) => m.content.trim().length > 0 && !m.isError)
-        .map((m) => ({role: m.role, content: m.content}));
-
+      const historyForApi = buildCompactHistory(prefixMessages);
       const shouldUpdateTitle = msgIndex === 0 && chat.isAutoTitled !== false;
 
       setConversations((prev) =>
@@ -566,18 +573,14 @@ export function useConversations() {
         )
       );
 
-      const ok = await streamAssistantReply({
+      await streamAssistantReply({
         conversationId: activeChatId,
         historyForApi,
         assistantMessageId: newAssistantMsg.id,
         modelToUse: model,
       });
-
-      if (ok && shouldUpdateTitle) {
-        void generateSmartTitle(activeChatId, trimmed);
-      }
     },
-    [activeChatId, generateSmartTitle, isStreaming, model, streamAssistantReply]
+    [activeChatId, isStreaming, model, streamAssistantReply]
   );
 
   return {

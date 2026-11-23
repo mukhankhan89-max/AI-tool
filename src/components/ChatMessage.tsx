@@ -237,7 +237,7 @@ export const ChatMessage = memo(function ChatMessage({
           <div className="markdown-body text-slate-800 dark:text-slate-200 min-w-0">
             <Markdown
               remarkPlugins={[remarkGfm]}
-              rehypePlugins={[rehypeHighlight]}
+              rehypePlugins={isStreamingThis ? [] : [rehypeHighlight]}
               components={{
                 pre({children}) {
                   return <>{children}</>;
