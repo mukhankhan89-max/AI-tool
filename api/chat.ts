@@ -6,8 +6,11 @@ const DEFAULT_MODEL = 'gemini-3.1-flash-lite';
 const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
 const MAX_HISTORY_MESSAGES = 10;
 
-const SYSTEM_INSTRUCTION =
-  'Give concise, direct, accurate answers by default unless asked for detail. Use fenced Markdown code blocks with language tags.';
+const SYSTEM_INSTRUCTION = `You are Lumen, an ultra-fast, accurate, friendly AI assistant.
+Priority: Speed, Accuracy, Clarity, Usefulness, Conciseness.
+Style: Answer directly without intros, filler, repetition, or disclaimers. Never start with "Sure!", "Of course!", or "Certainly!", never repeat the user's question, and skip generic endings like "Let me know if you need anything else." Keep simple answers to 1-3 sentences, normal answers to 2-6 sentences, and complex topics structured and concise unless asked to expand. Use bullets only when they aid readability.
+Smart & Coding: Infer intent without unnecessary clarifying questions. Give clean, optimized code in fenced Markdown blocks with language tags, and state root causes first when debugging.
+Language: Reply in the user's language (English, Urdu, Roman Urdu, or mixed). If the user writes in Roman Urdu, reply in natural Roman Urdu.`;
 
 interface IncomingMessage {
   role: 'user' | 'assistant';
@@ -310,7 +313,6 @@ export async function POST(request: Request): Promise<Response> {
                 }
               : {
                   systemInstruction: SYSTEM_INSTRUCTION,
-                  thinkingConfig: {thinkingLevel: ThinkingLevel.MINIMAL},
                   abortSignal: attemptController.signal,
                 };
 
@@ -343,10 +345,9 @@ export async function POST(request: Request): Promise<Response> {
         }
       };
 
-      const modelsToTry =
-        requestedModel === 'gemini-4-hydrogen'
-          ? ['gemini-4-hydrogen', FALLBACK_MODEL]
-          : [requestedModel, requestedModel];
+      const alternateModel =
+        requestedModel === 'gemini-3.1-flash-lite' ? 'gemini-4-hydrogen' : FALLBACK_MODEL;
+      const modelsToTry = [requestedModel, alternateModel];
 
       let lastError: unknown = null;
 
@@ -356,10 +357,10 @@ export async function POST(request: Request): Promise<Response> {
           return;
         }
         const targetModel = modelsToTry[i];
-        const hasFallbackNext = i < modelsToTry.length - 1 && modelsToTry[i + 1] !== targetModel;
+        const hasFallbackNext = i < modelsToTry.length - 1;
 
         try {
-          await attemptStream(targetModel, hasFallbackNext ? 4000 : undefined);
+          await attemptStream(targetModel, hasFallbackNext ? 5000 : undefined);
           lastError = null;
           break;
         } catch (err) {
